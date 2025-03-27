@@ -41,6 +41,8 @@ except ImportError:
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter,timer):
+
+    oracle_view_selection = True
     first_iter = 0
 
     gaussians.training_setup(opt)
@@ -158,13 +160,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             idx = 0
             viewpoint_cams = []
 
-            while idx < batch_size :    
-                    
-                viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
-                if not viewpoint_stack :
-                    viewpoint_stack =  temp_list.copy()
-                viewpoint_cams.append(viewpoint_cam)
-                idx +=1
+            if oracle_view_selection:
+                viewpoint_cams = oracle_select_views(viewpoint_stack, gaussians, pipe, background, stage, scene, batch_size, temp_list)
+            else:
+                while idx < batch_size :    
+                        
+                    viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
+                    if not viewpoint_stack :
+                        print("Copying Temp List: ", temp_list)
+                        viewpoint_stack =  temp_list.copy()
+                    viewpoint_cams.append(viewpoint_cam)
+                    idx +=1
             if len(viewpoint_cams) == 0:
                 continue
         # print(len(viewpoint_cams))     
@@ -294,6 +300,45 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
+
+def oracle_select_views(viewpoint_pool, gaussians, pipe, background, stage, scene, batch_size, temp_list=None):
+    psnr_scores = []
+
+    print(f"\n[Oracle Selector] Evaluating {len(viewpoint_pool)} candidate views...")
+
+    for idx, cam in enumerate(viewpoint_pool):
+        render_pkg = render(cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type)
+        image = render_pkg["render"]
+        gt = cam.original_image.cuda() if scene.dataset_type != "PanopticSports" else cam["image"].cuda()
+
+        score = psnr(image.unsqueeze(0), gt.unsqueeze(0)).mean().item()
+        psnr_scores.append((score, cam))
+
+        # print(f"  → View {idx}: PSNR = {score:.2f}")
+
+    # Sort by PSNR descending
+    psnr_scores.sort(key=lambda x: -x[0])
+
+    # Get top-N
+    selected_views = [cam for (_, cam) in psnr_scores[:batch_size]]
+
+    print(f"\n[Oracle Selector] Top {batch_size} views selected:")
+    for i, (score, cam) in enumerate(psnr_scores[:batch_size]):
+        view_name = getattr(cam, "image_name", f"View{i}")
+        print(f"  ✅ {view_name}: PSNR = {score:.2f}")
+
+    # Remove selected from the pool
+    for cam in selected_views:
+        viewpoint_pool.remove(cam)
+
+    # Refill if empty
+    if len(viewpoint_pool) == 0 and temp_list is not None:
+        print("[Oracle Selector] Viewpoint pool exhausted. Refilling from temp_list.")
+        viewpoint_pool.extend(temp_list.copy())
+
+    return selected_views
+
+
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
@@ -317,7 +362,7 @@ def prepare_output_and_logger(expname):
         #     unique_str = str(uuid.uuid4())
         unique_str = expname
 
-        args.model_path = os.path.join("./output/", unique_str)
+        args.model_path = os.path.join("./output_oracle/", unique_str)
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
