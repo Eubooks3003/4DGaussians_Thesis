@@ -12,6 +12,7 @@
 import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from modified_diff_gaussian_rasterization import GaussianRasterizer as ModifiedGaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
@@ -137,3 +138,96 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "radii": radii,
             "depth":depth}
 
+
+
+def modified_render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None, stage="fine", cam_type=None):
+    """
+    Modified render function based on 4DGS, adding `pixel_gaussian_counter` for FisherRF-style analysis.
+    """
+    import math
+
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points.retain_grad()
+
+    means3D = pc.get_xyz
+
+    if cam_type != "PanopticSports":
+        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform.cuda(),
+            projmatrix=viewpoint_camera.full_proj_transform.cuda(),
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center.cuda(),
+            prefiltered=False,
+            debug=pipe.debug
+        )
+        time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0], 1)
+    else:
+        raster_settings = viewpoint_camera['camera']
+        time = torch.tensor(viewpoint_camera['time']).to(means3D.device).repeat(means3D.shape[0], 1)
+
+    rasterizer = ModifiedGaussianRasterizer(raster_settings=raster_settings)
+
+    means2D = screenspace_points
+    opacity = pc._opacity
+    shs = pc.get_features
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc._scaling
+        rotations = pc._rotation
+
+    if "coarse" in stage:
+        means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
+    elif "fine" in stage:
+        means3D_final, scales_final, rotations_final, opacity_final, shs_final = pc._deformation(
+            means3D, scales, rotations, opacity, shs, time)
+    else:
+        raise NotImplementedError
+
+    scales_final = pc.scaling_activation(scales_final)
+    rotations_final = pc.rotation_activation(rotations_final)
+    opacity = pc.opacity_activation(opacity_final)
+
+    colors_precomp = None
+    if override_color is None:
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+    else:
+        colors_precomp = override_color
+
+    # 🟢 Rasterization with pixel_gaussian_counter added to return
+    rendered_image, radii, depth, pixel_gaussian_counter = rasterizer(
+        means3D=means3D_final,
+        means2D=means2D,
+        shs=shs_final,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales_final,
+        rotations=rotations_final,
+        cov3D_precomp=cov3D_precomp
+    )
+
+    return {
+        "render": rendered_image,
+        "viewspace_points": screenspace_points,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "depth": depth,
+        "pixel_gaussian_counter": pixel_gaussian_counter  # 🟢 NEW
+    }

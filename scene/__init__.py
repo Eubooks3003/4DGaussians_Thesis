@@ -93,6 +93,14 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, self.maxtime)
 
+        # AV
+
+        self.train_cameras_set = set()
+        self.candidate_cameras_set = set(self.train_camera)  # Initially all are candidates
+
+        
+        # AV
+
     def save(self, iteration, stage):
         if stage == "coarse":
             point_cloud_path = os.path.join(self.model_path, "point_cloud/coarse_iteration_{}".format(iteration))
@@ -103,6 +111,24 @@ class Scene:
         self.gaussians.save_deformation(point_cloud_path)
     def getTrainCameras(self, scale=1.0):
         return self.train_camera
+    
+    # def getTrainCamerasAVS(self, scale=1.0):
+    #     filted_train_cameras = [self.train_camera[scale][i] for i in self.train_idxs]
+    #     return filted_train_cameras
+    
+    # def get_candidate_set(self):
+    #     # Get candidate set 
+    #     # Ensure resutls are always the same
+    #     candidate_set = sorted(list(self.all_train_set - set(self.train_idxs)))
+    #     # if self.candidate_views_filter is not None:
+    #     #     candidate_set = list(filter(self.candidate_views_filter, candidate_set))
+    #     return candidate_set
+
+    # def getCandidateCamerasAVS(self, scale=1.0):
+    #     candidate_set = list(self.get_candidate_set())
+    #     filted_train_cameras = [self.train_camera[scale][i] for i in candidate_set]
+    #     return filted_train_cameras
+    
 
     def getTestCameras(self, scale=1.0):
         return self.test_camera

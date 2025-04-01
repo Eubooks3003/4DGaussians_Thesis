@@ -31,6 +31,10 @@ from utils.scene_utils import render_training_image
 from time import time
 import copy
 
+# Active View Selection
+from active import methods_dict
+from active.schema import schema_dict
+
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 try:
@@ -40,12 +44,15 @@ except ImportError:
     TENSORBOARD_FOUND = False
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, train_iter,timer):
+                         gaussians, scene, stage, tb_writer, train_iter,timer, args):
 
-    oracle_view_selection = True
+    oracle_view_selection = False
+    active_view_selection = True
     first_iter = 0
+    base_iter = 0
 
     gaussians.training_setup(opt)
+
     if checkpoint:
         # breakpoint()
         if stage == "coarse" and stage not in checkpoint:
@@ -76,12 +83,44 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
 
+    init_ckpt_path = f"{args.model_path}/init.ckpt"
 
-    if not viewpoint_stack and not opt.dataloader:
-        # dnerf's branch
-        viewpoint_stack = [i for i in train_cams]
-        temp_list = copy.deepcopy(viewpoint_stack)
-    # 
+    save_checkpoint(gaussians, first_iter, scene, base_iter, save_path=init_ckpt_path, save_last=False)
+
+    
+    # AV
+    init_views = 4
+    all_cams = list(train_cams)  # Convert to list in case it's a Dataset object
+    print("TOTAL NUMBER OF VIEWS: ", len(all_cams))
+    random.shuffle(all_cams)
+
+    # Pick init_views randomly
+    init_train_cams = all_cams[:init_views]
+    remaining_cams = all_cams[init_views:]
+
+    # Assign to scene state
+    scene.train_cameras_set = set(init_train_cams)
+    scene.candidate_cameras_set = set(remaining_cams)
+
+    print(f"[AV Init] Selected {len(scene.train_cameras_set)} initial training views.")
+
+    active_method = methods_dict["H_reg"](args)
+
+    schema = schema_dict["v20seq4_inplace"](dataset_size=len(scene.getTrainCameras()), scene=scene)
+
+    load_its = generate_load_schedule(N = 240, M = 4, num_init_views = init_views, total_iterations = train_iter)
+    print(f"schema: {load_its}")
+    # AV
+    
+    if  not active_view_selection:
+        if not viewpoint_stack and not opt.dataloader:
+            # dnerf's branch
+            viewpoint_stack = [i for i in train_cams]
+            temp_list = copy.deepcopy(viewpoint_stack)
+    else:
+        viewpoint_stack = list(scene.train_cameras_set.copy())
+        print("AVS STARTING VIEWPOINT STACK WITH: ", len(viewpoint_stack))
+
     batch_size = opt.batch_size
     print("data loading done")
     if opt.dataloader:
@@ -102,11 +141,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         load_in_memory = True
         # batch_size = 4
         temp_list = get_stamp_list(viewpoint_stack,0)
-        viewpoint_stack = temp_list.copy()
+        # viewpoint_stack = temp_list.copy()
+        viewpoint_stack = scene.train_cameras_set.copy()
     else:
         load_in_memory = False 
                             # 
     count = 0
+
+    is_final_iteration = False
     for iteration in range(first_iter, final_iter+1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -137,12 +179,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
-
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
-
         # Pick a random Camera
 
         # dynerf's branch
@@ -160,7 +196,29 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             idx = 0
             viewpoint_cams = []
 
-            if oracle_view_selection:
+            if active_view_selection:
+                num_views = 0
+                if iteration in load_its:
+                    num_views = load_its[iteration]
+                    print("ADDING: ", num_views, " view in iteration: ", iteration)
+
+                    is_final_iteration = iteration == max(load_its.keys())
+                if num_views > 0:
+                    first_iter, base_iter, active_view_cams = active_select_views(gaussians, scene, num_views, active_method, pipe, background, iteration, init_ckpt_path, opt)
+
+                    for active_cam in active_view_cams:
+                        scene.train_cameras_set.add(active_cam)
+                        scene.candidate_cameras_set.discard(active_cam)
+                
+                while idx < batch_size:
+
+                    viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
+                    print("Appending viewpoint cam, viewpoint stack size: ", len(viewpoint_stack))
+                    if not viewpoint_stack :
+                        viewpoint_stack =  list(scene.train_cameras_set.copy())
+                    viewpoint_cams.append(viewpoint_cam)
+                    idx +=1
+            elif oracle_view_selection:
                 viewpoint_cams = oracle_select_views(viewpoint_stack, gaussians, pipe, background, stage, scene, batch_size, temp_list)
             else:
                 while idx < batch_size :    
@@ -173,6 +231,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     idx +=1
             if len(viewpoint_cams) == 0:
                 continue
+        
+        gaussians.update_learning_rate(iteration - base_iter)
+
+        # Every 1000 its we increase the levels of SH up to a maximum degree
+        if iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
+
         # print(len(viewpoint_cams))     
         # breakpoint()   
         # Render
@@ -184,6 +249,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         for viewpoint_cam in viewpoint_cams:
+
+            scene.train_cameras_set.add(viewpoint_cam)
+            scene.candidate_cameras_set.discard(viewpoint_cam)
+
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             images.append(image.unsqueeze(0))
@@ -236,18 +305,30 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
             total_point = gaussians._xyz.shape[0]
-            if iteration % 10 == 0:
+
+            if not active_view_selection:
+                if iteration % 10 == 0:
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
+                                            "psnr": f"{psnr_:.{2}f}",
+                                            "point":f"{total_point}"})
+                    progress_bar.update(10)
+            else:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
-                                          "psnr": f"{psnr_:.{2}f}",
-                                          "point":f"{total_point}"})
-                progress_bar.update(10)
+                        "psnr": f"{psnr_:.{2}f}",
+                        "point":f"{total_point}"})
+                progress_bar.n = iteration
+                progress_bar.refresh()
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
             timer.pause()
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
-            if (iteration in saving_iterations):
+            if not active_view_selection:
+                if (iteration in saving_iterations):
+                    print("\n[ITER {}] Saving Gaussians".format(iteration))
+                    scene.save(iteration, stage)
+            elif is_final_iteration:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
             if dataset.render_process:
@@ -301,20 +382,64 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
 
+def save_checkpoint(gaussians, iteration, scene, base_iter=0, save_path=None, save_last=True):
+    ckpt_dict = {"model_params": gaussians.capture(), "first_iter": iteration, "base_iter": base_iter}
+
+    if save_last:
+        last_path = scene.model_path + "/last.pth"
+        print("\n[ITER {}] Saving Checkpoint to {}".format(iteration, last_path))
+        torch.save(ckpt_dict, last_path)   
+
+    if save_path is None:
+        save_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
+    print("\n[ITER {}] Saving Checkpoint to {}".format(iteration, save_path))
+    torch.save(ckpt_dict, save_path)   
+
+def load_checkpoint(ckpt_path: str, gaussians, scene, opt, ignore_train_idxs=False):
+    ckpt_dict = torch.load(ckpt_path)
+    (model_params, first_iter) = ckpt_dict["model_params"], ckpt_dict["first_iter"]
+    gaussians.restore(model_params, opt)
+
+    base_iter = ckpt_dict.get("base_iter", 0)
+    return first_iter, base_iter
+
+def generate_load_schedule(N: int, M: int, num_init_views: int, total_iterations: int):
+    """
+    Just evenly splits the total views (N) into an init set and the rest to be added gradually.
+
+    Returns:
+        init_views: List[int]
+        load_its: Dict[int, int]
+    """
+    assert N > num_init_views
+    init_views = list(range(num_init_views))
+    remaining_views = N - num_init_views
+
+    assert remaining_views % M == 0, "Remaining views must be divisible by M"
+    steps = remaining_views // M
+    step_interval = total_iterations // steps
+
+    load_its = {}
+    it = step_interval
+    while remaining_views > 0:
+        load_its[it] = M
+        remaining_views -= M
+        it += step_interval
+
+    return load_its
+
 def oracle_select_views(viewpoint_pool, gaussians, pipe, background, stage, scene, batch_size, temp_list=None):
     psnr_scores = []
 
-    print(f"\n[Oracle Selector] Evaluating {len(viewpoint_pool)} candidate views...")
 
     for idx, cam in enumerate(viewpoint_pool):
-        render_pkg = render(cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type)
-        image = render_pkg["render"]
-        gt = cam.original_image.cuda() if scene.dataset_type != "PanopticSports" else cam["image"].cuda()
+        with torch.no_grad():
+            render_pkg = render(cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type)
+            image = render_pkg["render"]
+            gt = cam.original_image.cuda() if scene.dataset_type != "PanopticSports" else cam["image"].cuda()
 
-        score = psnr(image.unsqueeze(0), gt.unsqueeze(0)).mean().item()
-        psnr_scores.append((score, cam))
-
-        # print(f"  → View {idx}: PSNR = {score:.2f}")
+            score = psnr(image.unsqueeze(0), gt.unsqueeze(0)).mean().item()
+            psnr_scores.append((score, cam))
 
     # Sort by PSNR descending
     psnr_scores.sort(key=lambda x: -x[0])
@@ -322,24 +447,41 @@ def oracle_select_views(viewpoint_pool, gaussians, pipe, background, stage, scen
     # Get top-N
     selected_views = [cam for (_, cam) in psnr_scores[:batch_size]]
 
-    print(f"\n[Oracle Selector] Top {batch_size} views selected:")
-    for i, (score, cam) in enumerate(psnr_scores[:batch_size]):
-        view_name = getattr(cam, "image_name", f"View{i}")
-        print(f"  ✅ {view_name}: PSNR = {score:.2f}")
-
     # Remove selected from the pool
     for cam in selected_views:
         viewpoint_pool.remove(cam)
 
     # Refill if empty
     if len(viewpoint_pool) == 0 and temp_list is not None:
-        print("[Oracle Selector] Viewpoint pool exhausted. Refilling from temp_list.")
         viewpoint_pool.extend(temp_list.copy())
 
     return selected_views
 
+def active_select_views(gaussians, scene, num_views, active_method, pipe, background, iteration, init_ckpt_path, opt):
+    
+    if len(scene.candidate_cameras_set) == 0 and temp_list is not None:
+        print("[AVS] Candidate pool exhausted, refilling from temp_list.")
+        scene.candidate_cameras_set.update(temp_list.copy())
 
-def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
+    try:
+        # candidate_views_filter = getattr(schema, "candidate_views_filter")[iteration] if hasattr(schema, "candidate_views_filter") else None
+        # scene.candidate_views_filter = candidate_views_filter
+
+        selected_views = active_method.nbvs(gaussians, scene, num_views, pipe, background)
+
+    except RuntimeError as e:
+        print(e)
+        print("selector exited early")
+        save_checkpoint(gaussians, iteration - 1, scene)
+
+    gaussians.optimizer.zero_grad(set_to_none=True)
+    first_iter, base_iter = load_checkpoint(init_ckpt_path, gaussians, scene, opt, ignore_train_idxs=True)
+
+    print("ACTIVE VIEW SELECTED VIEWS: ")
+    return first_iter, base_iter, selected_views
+
+
+def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, args):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
@@ -349,10 +491,10 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     timer.start()
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
-                             gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer)
+                             gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer, args)
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, "fine", tb_writer, opt.iterations,timer)
+                         gaussians, scene, "fine", tb_writer, opt.iterations,timer, args)
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:
@@ -362,7 +504,7 @@ def prepare_output_and_logger(expname):
         #     unique_str = str(uuid.uuid4())
         unique_str = expname
 
-        args.model_path = os.path.join("./output_oracle/", unique_str)
+        args.model_path = os.path.join("./output_AVS/", unique_str)
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -449,12 +591,27 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7000,14000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 14000, 20000, 30_000, 45000, 60000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[13983, 14000, 20000, 30_000, 45000, 60000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
+
+    # AVS
+    parser.add_argument("--method", type=str, default="rand")
+    parser.add_argument("--schema", type=str, default="all")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--reg_lambda", type=float, default=1e-6)
+    parser.add_argument("--I_test", action="store_true", help="Use I test to get the selection base")
+    parser.add_argument("--I_acq_reg", action="store_true", help="apply reg_lambda to acq H too")
+    parser.add_argument("--sh_up_every", type=int, default=5_000, help="increase spherical harmonics every N iterations")
+    parser.add_argument("--sh_up_after", type=int, default=-1, help="start to increate active_sh_degree after N iterations")
+    parser.add_argument("--min_opacity", type=float, default=0.005, help="min_opacity to prune")
+    parser.add_argument("--filter_out_grad", nargs="+", type=str, default=["rotation"])
+    parser.add_argument("--log_every_image", action="store_true", help="log every images during traing")
+    parser.add_argument("--override_idxs", default=None, type=str, help="speical test idxs on uncertainty evaluation")
+    
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -471,7 +628,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname)
+    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args)
 
     # All done
     print("\nTraining complete.")
