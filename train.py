@@ -147,14 +147,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     print(f"schema: {load_its}")
     # AV
     
-    if  not active_view_selection:
-        if not viewpoint_stack and not opt.dataloader:
-            # dnerf's branch
-            viewpoint_stack = [i for i in train_cams]
-            temp_list = copy.deepcopy(viewpoint_stack)
-    else:
-        viewpoint_stack = list(scene.train_cameras_set.copy())
-        print("AVS STARTING VIEWPOINT STACK WITH: ", len(viewpoint_stack))
+    # if  not active_view_selection:
+    #     if not viewpoint_stack and not opt.dataloader:
+    #         # dnerf's branch
+    #         viewpoint_stack = [i for i in train_cams]
+    #         temp_list = copy.deepcopy(viewpoint_stack)
+    # else:
+    viewpoint_stack = list(scene.train_cameras_set.copy())
+    print("STARTING VIEWPOINT STACK WITH: ", len(viewpoint_stack))
 
     batch_size = opt.batch_size
     print("data loading done")
@@ -228,52 +228,46 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 loader = iter(viewpoint_stack_loader)
 
         else:
-            idx = 0
             viewpoint_cams = []
-
-            if active_view_selection:
-                num_views = 0
-                if iteration in load_its:
-                    num_views = load_its[iteration]
-                    print("ADDING: ", num_views, " view in iteration: ", iteration)
-
-                    is_final_iteration = iteration == max(load_its.keys())
-                if num_views > 0:
-                    save_checkpoint(gaussians, iteration, scene, base_iter, save_path=init_ckpt_path, save_last=False)
-                    first_iter, base_iter, active_view_cams = active_select_views(gaussians, scene, num_views, active_method, pipe, background, iteration, init_ckpt_path, opt)
-
-                    for active_cam in active_view_cams:
-                        scene.train_cameras_set.add(active_cam)
-                        scene.candidate_cameras_set.discard(active_cam)
-                    
-                    plot_camera_timestamps(
-                        train_cams=scene.train_cameras_set,
-                        candidate_cams=scene.candidate_cameras_set,
-                        save_path=f"{args.model_path}/timestamp_dist_iter_{iteration}.png",
-                        title=f"View Timestamp Distribution @ Iter {iteration}"
-                    )
+            idx = 0
+            num_views = 0
+            if iteration in load_its:
+                num_views = load_its[iteration]
                 
-                while idx < batch_size:
+            if num_views > 0:
+                active_viewpoint_cams = []
+                if active_view_selection:
+                    save_checkpoint(gaussians, iteration, scene, base_iter, save_path=init_ckpt_path, save_last=False)
+                    first_iter, base_iter, active_viewpoint_cams = active_select_views(gaussians, scene, num_views, active_method, pipe, background, iteration, init_ckpt_path, opt)
 
-                    viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
-                    # print("Appending viewpoint cam, viewpoint stack size: ", len(viewpoint_stack))
-                    if not viewpoint_stack :
-                        viewpoint_stack =  list(scene.train_cameras_set.copy())
-                    viewpoint_cams.append(viewpoint_cam)
-                    idx +=1
-            elif oracle_view_selection:
-                viewpoint_cams = oracle_select_views(viewpoint_stack, gaussians, pipe, background, stage, scene, batch_size, temp_list)
-            else:
-                while idx < batch_size :    
-                        
-                    viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
-                    if not viewpoint_stack :
-                        viewpoint_stack =  temp_list.copy()
-                    viewpoint_cams.append(viewpoint_cam)
-                    idx +=1
-            if len(viewpoint_cams) == 0:
-                continue
-        
+                elif oracle_view_selection:
+                    active_viewpoint_cams = oracle_select_views(viewpoint_stack, gaussians, pipe, background, stage, scene, batch_size)
+                    
+                else:
+                    print("Randomly adding views")
+                    active_viewpoint_cams = random_select_views(scene, num_views)
+
+                for active_cam in active_viewpoint_cams:
+                    scene.train_cameras_set.add(active_cam)
+                    scene.candidate_cameras_set.discard(active_cam)
+                    
+                plot_camera_timestamps(
+                    train_cams=scene.train_cameras_set,
+                    candidate_cams=scene.candidate_cameras_set,
+                    save_path=f"{args.model_path}/timestamp_dist_iter_{iteration}.png",
+                    title=f"View Timestamp Distribution @ Iter {iteration}"
+                )
+            
+            # Randomly take viewpoints from available pool
+            while idx < batch_size:
+
+                viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
+                # print("Appending viewpoint cam, viewpoint stack size: ", len(viewpoint_stack))
+                if not viewpoint_stack :
+                    viewpoint_stack =  list(scene.train_cameras_set.copy())
+                viewpoint_cams.append(viewpoint_cam)
+                idx +=1
+
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -465,11 +459,15 @@ def generate_load_schedule(N: int, M: int, num_init_views: int, total_iterations
 
     return load_its
 
-def oracle_select_views(viewpoint_pool, gaussians, pipe, background, stage, scene, batch_size, temp_list=None):
+def oracle_select_views(viewpoint_pool, gaussians, pipe, background, stage, scene, batch_size):
     psnr_scores = []
 
 
-    for idx, cam in enumerate(viewpoint_pool):
+    # if len(scene.candidate_cameras_set) == 0 and temp_list is not None:
+    #     print("[AVS] Candidate pool exhausted, refilling from temp_list.")
+    #     scene.candidate_cameras_set.update(temp_list.copy())
+
+    for idx, cam in enumerate(scene.candidate_cameras_set):
         with torch.no_grad():
             render_pkg = render(cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type)
             image = render_pkg["render"]
@@ -488,21 +486,24 @@ def oracle_select_views(viewpoint_pool, gaussians, pipe, background, stage, scen
     # Get top-N
     selected_views = [cam for (_, cam) in psnr_scores[:batch_size]]
 
-    # Remove selected from the pool
-    for cam in selected_views:
-        viewpoint_pool.remove(cam)
+    # # Remove selected from the pool
+    # for cam in selected_views:
+    #     viewpoint_pool.remove(cam)
 
-    # Refill if empty
-    if len(viewpoint_pool) == 0 and temp_list is not None:
-        viewpoint_pool.extend(temp_list.copy())
+    # # Refill if empty
+    # if len(viewpoint_pool) == 0 and temp_list is not None:
+    #     viewpoint_pool.extend(temp_list.copy())
 
     return selected_views
 
+def random_select_views(scene, num_views):
+    return set(random.sample(scene.candidate_cameras_set, num_views))
+
 def active_select_views(gaussians, scene, num_views, active_method, pipe, background, iteration, init_ckpt_path, opt):
     
-    if len(scene.candidate_cameras_set) == 0 and temp_list is not None:
-        print("[AVS] Candidate pool exhausted, refilling from temp_list.")
-        scene.candidate_cameras_set.update(temp_list.copy())
+    # if len(scene.candidate_cameras_set) == 0 and temp_list is not None:
+    #     print("[AVS] Candidate pool exhausted, refilling from temp_list.")
+    #     scene.candidate_cameras_set.update(temp_list.copy())
 
     try:
         # candidate_views_filter = getattr(schema, "candidate_views_filter")[iteration] if hasattr(schema, "candidate_views_filter") else None

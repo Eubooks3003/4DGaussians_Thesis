@@ -22,7 +22,8 @@ class HRegSelector(torch.nn.Module):
 
     
     def nbvs(self, gaussians, scene: Scene, num_views, pipe, background) -> List[int]:
-        candidate_cameras = list(scene.candidate_cameras_set)
+        # candidate_cameras = list(scene.candidate_cameras_set)
+        candidate_cameras = scene.get_candidate_views_soft_diverse()
         viewpoint_cams = list(scene.train_cameras_set)
 
         if self.I_test == True:
