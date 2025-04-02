@@ -65,6 +65,7 @@ def plot_camera_timestamps(train_cams, candidate_cams, save_path=None, title="Ti
         plt.show()
     plt.close()
 
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter,timer,view_selection_mode, args):
@@ -113,6 +114,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
+
+    # save_dir = f"{args.model_path}/motion_scores/"
+    # motion_scores = scene.compute_optical_flow_dynamic_labels(save_dir)
 
     init_ckpt_path = f"{args.model_path}/init.ckpt"
 

@@ -5,8 +5,8 @@ import natsort
 import re
 
 # Set your folder path
-image_folder = "/home/ellina/Thesis/4DGaussians_Thesis/output_AVS_0/hypernerf/aleks"
-output_video = "timestamp_dist_video.mp4"
+image_folder = "/home/ellina/Thesis/4DGaussians_Thesis/output_AVS_2/hypernerf/aleks"
+output_video = "timestamp_dist_video_diverse.mp4"
 fps = 5
 
 # Get list of matching PNGs
@@ -22,7 +22,7 @@ for img in images:
     match = pattern.search(os.path.basename(img))
     if match:
         iter_num = int(match.group(1))
-        if iter_num % 5 == 0 and iter_num % 16 != 0:
+        if iter_num % 50 == 0 and iter_num % 237 != 0:
             multiples_of_5.append(img)
         else:
             others.append(img)
