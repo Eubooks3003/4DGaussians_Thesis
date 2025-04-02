@@ -42,12 +42,43 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+import matplotlib.pyplot as plt
+
+def plot_camera_timestamps(train_cams, candidate_cams, save_path=None, title="Timestamp Distribution"):
+    def extract_times(cams):
+        return [cam.time if hasattr(cam, 'time') else 0 for cam in cams]
+
+    train_times = extract_times(train_cams)
+    candidate_times = extract_times(candidate_cams)
+
+    plt.figure(figsize=(10, 4))
+    plt.hist([train_times, candidate_times], bins=20, label=["Train Cameras", "Candidate Cameras"], color=["blue", "orange"], alpha=0.7, stacked=False)
+
+    plt.legend()
+    plt.xlabel("Timestamp")
+    plt.ylabel("Count")
+    plt.title(title)
+    if save_path:
+        plt.savefig(save_path)
+    else:
+        plt.show()
+    plt.close()
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, train_iter,timer, args):
-
+                         gaussians, scene, stage, tb_writer, train_iter,timer,view_selection_mode, args):
     oracle_view_selection = False
-    active_view_selection = True
+    active_view_selection = False
+    if view_selection_mode == "oracle":
+        oracle_view_selection = True
+        print("VIEW SELECTION MODE: ORACLE")
+    elif view_selection_mode == "AV":
+        active_view_selection = True
+        print("VIEW SELECTION MODE: ACTIVE VIEW SELECTION")
+    else:
+        print("VIEW SELECTION MODE: RANDOM")
+
     first_iter = 0
     base_iter = 0
 
@@ -204,16 +235,24 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
                     is_final_iteration = iteration == max(load_its.keys())
                 if num_views > 0:
+                    save_checkpoint(gaussians, iteration, scene, base_iter, save_path=init_ckpt_path, save_last=False)
                     first_iter, base_iter, active_view_cams = active_select_views(gaussians, scene, num_views, active_method, pipe, background, iteration, init_ckpt_path, opt)
 
                     for active_cam in active_view_cams:
                         scene.train_cameras_set.add(active_cam)
                         scene.candidate_cameras_set.discard(active_cam)
+                    
+                    plot_camera_timestamps(
+                        train_cams=scene.train_cameras_set,
+                        candidate_cams=scene.candidate_cameras_set,
+                        save_path=f"{args.model_path}/timestamp_dist_iter_{iteration}.png",
+                        title=f"View Timestamp Distribution @ Iter {iteration}"
+                    )
                 
                 while idx < batch_size:
 
                     viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
-                    print("Appending viewpoint cam, viewpoint stack size: ", len(viewpoint_stack))
+                    # print("Appending viewpoint cam, viewpoint stack size: ", len(viewpoint_stack))
                     if not viewpoint_stack :
                         viewpoint_stack =  list(scene.train_cameras_set.copy())
                     viewpoint_cams.append(viewpoint_cam)
@@ -225,14 +264,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         
                     viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
                     if not viewpoint_stack :
-                        print("Copying Temp List: ", temp_list)
                         viewpoint_stack =  temp_list.copy()
                     viewpoint_cams.append(viewpoint_cam)
                     idx +=1
             if len(viewpoint_cams) == 0:
                 continue
         
-        gaussians.update_learning_rate(iteration - base_iter)
+        gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -293,7 +331,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         
         loss.backward()
         if torch.isnan(loss).any():
-            print("loss is nan,end training, reexecv program now.")
+            # print("Loss is NaN. Reloading last checkpoint and continuing from previous iteration...")
+            # first_iter, base_iter = load_checkpoint(init_ckpt_path, gaussians, scene, opt, ignore_train_idxs=False)
+            # continue  # skip optimizer step and move to next iteration
+
+            print("+++++++++++++++++++++++ Loss is NAN,end training, reexecv program now. +++++++++++++++++++")
             os.execv(sys.executable, [sys.executable] + sys.argv)
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
@@ -305,30 +347,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
             total_point = gaussians._xyz.shape[0]
-
-            if not active_view_selection:
-                if iteration % 10 == 0:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
-                                            "psnr": f"{psnr_:.{2}f}",
-                                            "point":f"{total_point}"})
-                    progress_bar.update(10)
-            else:
+            if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
-                        "psnr": f"{psnr_:.{2}f}",
-                        "point":f"{total_point}"})
-                progress_bar.n = iteration
-                progress_bar.refresh()
+                                        "psnr": f"{psnr_:.{2}f}",
+                                        "point":f"{total_point}"})
+                progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
             timer.pause()
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
-            if not active_view_selection:
-                if (iteration in saving_iterations):
-                    print("\n[ITER {}] Saving Gaussians".format(iteration))
-                    scene.save(iteration, stage)
-            elif is_final_iteration:
+            if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
             if dataset.render_process:
@@ -378,9 +408,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
+            # if iteration % 100 == 0 and not active_view_selection:
+            #     print("\n[ITER {}] Saving Checkpoint".format(iteration))
+            #     save_checkpoint(gaussians, iteration, scene, base_iter, save_path=init_ckpt_path, save_last=False)
+            #     # torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
 
 def save_checkpoint(gaussians, iteration, scene, base_iter=0, save_path=None, save_last=True):
     ckpt_dict = {"model_params": gaussians.capture(), "first_iter": iteration, "base_iter": base_iter}
@@ -399,6 +430,8 @@ def load_checkpoint(ckpt_path: str, gaussians, scene, opt, ignore_train_idxs=Fal
     ckpt_dict = torch.load(ckpt_path)
     (model_params, first_iter) = ckpt_dict["model_params"], ckpt_dict["first_iter"]
     gaussians.restore(model_params, opt)
+
+    print(f"\n[LOAD] Loading checkpoint from iteration {first_iter} at {ckpt_path}")
 
     base_iter = ckpt_dict.get("base_iter", 0)
     return first_iter, base_iter
@@ -441,8 +474,12 @@ def oracle_select_views(viewpoint_pool, gaussians, pipe, background, stage, scen
             score = psnr(image.unsqueeze(0), gt.unsqueeze(0)).mean().item()
             psnr_scores.append((score, cam))
 
-    # Sort by PSNR descending
-    psnr_scores.sort(key=lambda x: -x[0])
+    # # Sort by PSNR descending
+    # psnr_scores.sort(key=lambda x: -x[0])
+
+    # Sort by PSNR ascending (hardest)
+    psnr_scores.sort(key=lambda x: x[0])
+
 
     # Get top-N
     selected_views = [cam for (_, cam) in psnr_scores[:batch_size]]
@@ -474,8 +511,8 @@ def active_select_views(gaussians, scene, num_views, active_method, pipe, backgr
         print("selector exited early")
         save_checkpoint(gaussians, iteration - 1, scene)
 
-    gaussians.optimizer.zero_grad(set_to_none=True)
     first_iter, base_iter = load_checkpoint(init_ckpt_path, gaussians, scene, opt, ignore_train_idxs=True)
+    gaussians.optimizer.zero_grad(set_to_none=True)
 
     print("ACTIVE VIEW SELECTED VIEWS: ")
     return first_iter, base_iter, selected_views
@@ -483,7 +520,7 @@ def active_select_views(gaussians, scene, num_views, active_method, pipe, backgr
 
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, args):
     # first_iter = 0
-    tb_writer = prepare_output_and_logger(expname)
+    tb_writer = prepare_output_and_logger(expname, args.exp_num, args.view_selection_method)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
     dataset.model_path = args.model_path
     timer = Timer()
@@ -491,20 +528,25 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     timer.start()
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
-                             gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer, args)
+                             gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer, args.view_selection_method, args)
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, "fine", tb_writer, opt.iterations,timer, args)
+                         gaussians, scene, "fine", tb_writer, opt.iterations,timer, args.view_selection_method, args)
 
-def prepare_output_and_logger(expname):    
+def prepare_output_and_logger(expname, exp_num, view_selection_method):    
     if not args.model_path:
         # if os.getenv('OAR_JOB_ID'):
         #     unique_str=os.getenv('OAR_JOB_ID')
         # else:
         #     unique_str = str(uuid.uuid4())
         unique_str = expname
+        view_method = "random"
 
-        args.model_path = os.path.join("./output_AVS/", unique_str)
+        if view_selection_method == "oracle":
+            view_method = "oracle"
+        elif view_selection_method == "AV":
+            view_method = "AVS"
+        args.model_path = os.path.join(f"./output_{view_method}_{exp_num}/", unique_str)
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -514,6 +556,7 @@ def prepare_output_and_logger(expname):
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
+        print("TENSORBOARD FOUND")
         tb_writer = SummaryWriter(args.model_path)
     else:
         print("Tensorboard not available: not logging progress")
@@ -611,6 +654,9 @@ if __name__ == "__main__":
     parser.add_argument("--filter_out_grad", nargs="+", type=str, default=["rotation"])
     parser.add_argument("--log_every_image", action="store_true", help="log every images during traing")
     parser.add_argument("--override_idxs", default=None, type=str, help="speical test idxs on uncertainty evaluation")
+
+    parser.add_argument("--view_selection_method", type=str, default="rand")
+    parser.add_argument("--exp_num", type=int, default=0)
     
     
     args = parser.parse_args(sys.argv[1:])
